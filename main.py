@@ -4,73 +4,79 @@ import json
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
-import os
-from bs4 import BeautifulSoup
+import threading
 
-base_folder = "" # "C:\\Users\\Test", "root/Test/save"
-process_single_entry = False  # Setze diese auf True, um nur einen Eintrag zu verarbeiten
+# Define your base folder and other constants
+base_folder = "yoursavepath"
+urls_path = "yourpath/urls.txt"
+key = "session=yourKey"
+process_single_entry = False  # Set this to True to process only one entry
 
-wait = 5  # Wartezeit in Sekunden
-tries = 100  # Anzahl der Wiederholungsversuche
-maxgb = 400
+wait = 5  # Wait time in seconds
+tries = 100  # Number of retries
+maxgb = 470
+timeout = 7200  # 12 hours in seconds
+
+download_lock = threading.Lock()  # Lock for thread-safe writing
 
 def check_file_exists(file_path):
     return os.path.exists(file_path)
 
-
 def get_existing_files(user_folder):
     bilder_folder = os.path.join(user_folder, "Bilder")
     video_folder = os.path.join(user_folder, "Videos")
-    existing_files = {file for folder in [bilder_folder, video_folder] for file in os.listdir(folder)}
+    audio_folder = os.path.join(user_folder, "Audio")
+    existing_files = {file for folder in [bilder_folder, video_folder, audio_folder] for file in os.listdir(folder)}
     return existing_files
 
+def get_file_size(file_path):
+    return os.path.getsize(file_path) if os.path.exists(file_path) else 0
 
-def download(url, user_folder, wait, tries, current, total):
-    bilder_folder = os.path.join(user_folder, "Bilder")
-    video_folder = os.path.join(user_folder, "Videos")
+def log_downloaded_url(url, log_file_path):
+    normalized_url = re.sub(r'https://(c1|n1)\.coomer\.su/data', "https://coomer.su/data", url)
+    with download_lock:
+        with open(log_file_path, 'a') as log_file:
+            log_file.write(normalized_url + '\n')
+
+def download(url, save_path, wait, tries, current, total, log_file_path):
     retries = tries
     while retries > 0:
         try:
             response = requests.get(url, stream=True)
             if response.status_code == 200:
-                filename = url.split('/')[-1]
-                if any(url.endswith(ext) for ext in ['jpg', 'jpeg', 'png', 'gif']):
-                    save_path = os.path.join(bilder_folder, filename)
-                elif any(url.endswith(ext) for ext in ['mp4', 'avi', 'mov', 'm4v']):
-                    save_path = os.path.join(video_folder, filename)
-                else:
-                    return
-
                 with open(save_path, 'wb') as f:
                     for chunk in response.iter_content(chunk_size=65536):
                         if chunk:
                             f.write(chunk)
-                print(f"Downloaded and saved {url} to {save_path} ({current} of {total})")
-                break
+                
+                if os.path.exists(save_path):  # Überprüfen, ob die Datei existiert
+                    actual_size = os.path.getsize(save_path)
+                    expected_size = int(response.headers.get('content-length', 0))
+                    if actual_size == expected_size:
+                        print(f"Downloaded and saved {url} to {save_path} ({current} of {total})")
+                        log_downloaded_url(url, log_file_path)
+                        return True
+                    else:
+                        print(f"Incomplete download detected for {url}. Expected size: {expected_size}, actual size: {actual_size}")
+                        os.remove(save_path)
+                        return False
+                else:
+                    print(f"File {save_path} does not exist after download attempt.")
+                    return False
             elif response.status_code == 429:
                 print(f"Too many requests, waiting {wait} seconds...")
                 time.sleep(wait)
                 retries -= 1
             else:
                 print(f"Failed to download {url}, status code {response.status_code}")
-                break
+                return False
         except requests.exceptions.RequestException as e:
             print(f"Error downloading {url}: {e}")
-            break
+            return False
+    return False
 
 
-def call_download(user_folder, wait, tries, post_distance):
-    urls = get_urls_from_file(user_folder)
-    existing_files = get_existing_files(user_folder)
-
-    # Bestimme, welche URLs heruntergeladen werden müssen
-    urls_to_download = [url for url in urls if url.split('/')[-1] not in existing_files]
-
-    # Verwende post_distance, um zu bestimmen, wie viele URLs heruntergeladen werden sollen
-    if post_distance is not None:
-        urls_to_download = urls_to_download[:post_distance]  # Begrenzt die Liste auf die ersten 'post_distance' URLs
-        print(f"URLs zur Download-Vorbereitung: {len(urls_to_download)} URLs basierend auf post_distance")
-
+def call_download(user_folder, wait, tries, urls_to_download):
     if not urls_to_download:
         print("Keine neuen Dateien zum Downloaden vorhanden.")
         return
@@ -78,23 +84,69 @@ def call_download(user_folder, wait, tries, post_distance):
     total_urls = len(urls_to_download)
     print(f"Starte den Download von {total_urls} URLs.")
 
-    with ThreadPoolExecutor(max_workers=3) as executor:
+    existing_files = get_existing_files(user_folder)
+    bilder_folder = os.path.join(user_folder, "Bilder")
+    video_folder = os.path.join(user_folder, "Videos")
+    audio_folder = os.path.join(user_folder, "Audio")
+    urls_to_really_download = []
+
+    log_file_path = os.path.join(user_folder, 'downloaded.txt')
+
+    for url in urls_to_download:
+        filename = url.split('/')[-1]
+        if any(url.endswith(ext) for ext in ['jpg', 'jpeg', 'png', 'gif']):
+            save_path = os.path.join(bilder_folder, filename)
+        elif any(url.endswith(ext) for ext in ['mp4', 'avi', 'mov', 'm4v']):
+            save_path = os.path.join(video_folder, filename)
+        elif any(url.endswith(ext) for ext in ['mp3', 'wav', 'flac']):
+            save_path = os.path.join(audio_folder, filename)
+        else:
+            continue
+
+        normalized_url = re.sub(r'https://(c1|n1)\.coomer\.su/data', "https://coomer.su/data", url)
+        if filename in existing_files and get_file_size(save_path) == int(requests.head(url).headers.get('content-length', 0)):
+            print(f"File {filename} already exists and is complete.")
+            log_downloaded_url(normalized_url, log_file_path)
+        else:
+            urls_to_really_download.append(url)
+
+    print(f"URLs to really download: {len(urls_to_really_download)}")
+
+    if not urls_to_really_download:
+        print("Keine neuen Dateien zum Downloaden vorhanden.")
+        return
+
+    with ThreadPoolExecutor(max_workers=6) as executor:
         futures = []
-        for i, url in enumerate(urls_to_download):
-            print(f"Download-Thread startet für {url}")
-            futures.append(executor.submit(download, url, user_folder, wait, tries, i+1, total_urls))
+        for i, url in enumerate(urls_to_really_download):
+            filename = url.split('/')[-1]
+            if any(url.endswith(ext) for ext in ['jpg', 'jpeg', 'png', 'gif']):
+                save_path = os.path.join(bilder_folder, filename)
+            elif any(url.endswith(ext) for ext in ['mp4', 'avi', 'mov', 'm4v']):
+                save_path = os.path.join(video_folder, filename)
+            elif any(url.endswith(ext) for ext in ['mp3', 'wav', 'flac']):
+                save_path = os.path.join(audio_folder, filename)
+            else:
+                continue
+
+            print(f"Start downloading: {url}")
+            futures.append(executor.submit(download, url, save_path, wait, tries, i+1, total_urls, log_file_path))
         for future in futures:
-            future.result()
+            future.result()  # We don't need to handle the result here
 
     print("Alle Downloads abgeschlossen.")
     create_completion_file(user_folder)
 
-def get_urls_from_file(user_folder):
-    urls_data_urls_path = os.path.join(user_folder, "urls_data_urls.txt")
-    with open(urls_data_urls_path, 'r') as file:
-        urls = [line.strip() for line in file.readlines()]
-    return urls
+def get_urls_from_file(file_path):
+    if not os.path.exists(file_path):
+        return set()
+    with open(file_path, 'r') as file:
+        return set(re.sub(r'https://(c1|n1)\.coomer\.su/data', "https://coomer.su/data", line.strip()) for line in file)
 
+def save_urls_to_file(file_path, urls):
+    with open(file_path, 'w') as file:
+        for url in sorted(urls):  # Optional: sort the URLs for consistency
+            file.write(url + '\n')
 
 def get_folder_size(base_folder):
     total_size = 0
@@ -105,61 +157,39 @@ def get_folder_size(base_folder):
                 total_size += os.path.getsize(fp)
     return total_size / (1024 ** 3)  # Größe in GB
 
-
-
 def rly_download(user_folder, wait, tries, maxgb):
     fertig_file = os.path.join(user_folder, "fertig.txt")
-    if not os.path.exists(fertig_file):
-        print("Fertig.txt existiert nicht, starte vollständigen Download")
-        call_download(user_folder, wait, tries, None)  # Keine spezifische Begrenzung, wenn keine fertig.txt existiert
-    else:
-        post_distance = post_urls_fertig_distance_calc(user_folder)
-        print(f"Berechnete Post-Distance: {post_distance}")
-
-        if post_distance <= 0:
-            print("Keine neuen Dateien zu downloaden oder Fehler in der Post-Distance Berechnung.")
-            return
-
-        current_size = get_folder_size(user_folder)
-        print(f"Aktuelle Größe: {current_size:.2f} GB, maximal erlaubt: {maxgb} GB")
-
-        if current_size < maxgb:
-            print("Ausreichend Speicherplatz vorhanden, starte Download...")
-            call_download(user_folder, wait, tries, post_distance)  # Verwende post_distance korrekt
-        else:
-            print("Nicht genug Speicherplatz vorhanden.")
-
-
-
-
-
-
-
-def post_urls_fertig_distance_calc(user_folder):
     urls_data_urls_path = os.path.join(user_folder, "urls_data_urls.txt")
-    fertig_file = os.path.join(user_folder, "fertig.txt")
-    
-    try:
-        with open(urls_data_urls_path, 'r') as f:
-            post_urls = [url.strip() for url in f.readlines()]
-        with open(fertig_file, 'r') as f:
-            fertig_url = f.readlines()[1].strip()  # Zweite Zeile lesen und trimmen
-        print(f"Anzahl der URLs: {len(post_urls)}")
-        print(f"Suche nach URL: {fertig_url}")
-    except FileNotFoundError as e:
-        print(f"Fehler beim Öffnen der Dateien: {e}")
-        return rly_download(user_folder, wait, tries, maxgb)
+    downloaded_urls_path = os.path.join(user_folder, "downloaded.txt")
 
-    if fertig_url in post_urls:
-        post_distance = post_urls.index(fertig_url)
-        print(f"URL gefunden an Position: {post_distance}")
-    else:
-        print("URL nicht in der Liste gefunden.")
-        post_distance = -1  # Kann durch eine andere Handhabung ersetzt werden, z.B. einen Fehler werfen
+    while True:
+        if os.path.exists(fertig_file):
+            print("Fertig.txt existiert, überprüfe heruntergeladene Dateien.")
+            
+            urls_data_urls = get_urls_from_file(urls_data_urls_path)
+            downloaded_urls = get_urls_from_file(downloaded_urls_path)
+            
+            urls_to_download = list(urls_data_urls - downloaded_urls)
 
-    return post_distance
-   
+            print(f"Berechne fehlende Dateien: {len(urls_to_download)} URLs fehlen.")
 
+            current_size = get_folder_size(base_folder)
+            print(f"Aktuelle Größe: {current_size:.2f} GB, maximal erlaubt: {maxgb} GB")
+
+            if current_size < maxgb:
+                print("Ausreichend Speicherplatz vorhanden, starte Download...")
+                call_download(user_folder, wait, tries, urls_to_download)  # Starte den Download der fehlenden URLs
+                break
+            else:
+                print("Nicht genug Speicherplatz vorhanden. Warte 12 Stunden...")
+                time.sleep(timeout)
+        else:
+            print("Fertig.txt existiert nicht, starte vollständigen Download")
+            urls_data_urls = get_urls_from_file(urls_data_urls_path)
+            downloaded_urls = get_urls_from_file(downloaded_urls_path)
+            urls_to_download = list(urls_data_urls - downloaded_urls)
+            call_download(user_folder, wait, tries, urls_to_download)  # Volle Liste zum Download
+            break
 
 def create_directories(base_folder, user_name):
     neu_folder = os.path.join(base_folder, "neu")
@@ -170,7 +200,8 @@ def create_directories(base_folder, user_name):
     user_folder = os.path.join(neu_folder, user_name)
     bilder_folder = os.path.join(user_folder, "Bilder")
     video_folder = os.path.join(user_folder, "Videos")
-    for folder in [user_folder, bilder_folder, video_folder]:
+    audio_folder = os.path.join(user_folder, "Audio")
+    for folder in [user_folder, bilder_folder, video_folder, audio_folder]:
         if not os.path.exists(folder):
             os.makedirs(folder)
             print(f"Ordner erstellt: {folder}")
@@ -194,56 +225,81 @@ def create_completion_file(user_folder):
 
     print(f"Completion file created at {fertig_path}")
 
-
 def extract_name_from_url(url):
     parts = url.split('/')
     name_index = parts.index('user') + 1
     return parts[name_index] if name_index < len(parts) else None
 
+import requests
+
 def fetch_post_anzahl(baseurl):
-    retries = tries  # Maximale Anzahl von Wiederholungsversuchen
-    while retries > 0:
+    api_url = baseurl.replace("https://coomer.su/", "https://coomer.su/api/v1/")
+    offset = 0
+    wait = 1  # Wartezeit zwischen den Anfragen, falls gewünscht
+
+    while True:
+        paginated_url = f"{api_url}?o={offset}"
         try:
-            response = requests.get(baseurl)
-            response.raise_for_status()  # Dies wirft eine Exception bei 4xx und 5xx Antworten
-            html_content = response.text
-            match = re.search(r'Showing \d+ - \d+ of (\d+)', html_content)
-            return int(match.group(1)) if match else html_content.count('<article')
+            response = requests.get(paginated_url, timeout=4)  # Timeout auf 4 Sekunden gesetzt
+            response.raise_for_status()
+
+            page_posts = response.json()
+
+            # Wenn keine Posts mehr kommen (leere Liste oder Fehlermeldung), breche die Schleife ab
+            if not page_posts:
+                print(f"Keine weiteren Posts ab Offset {offset}, Gesamtposts: {offset}")
+                return offset  # Rückgabe der Gesamtzahl der Posts
+
+            # Wenn mehr Posts zurückgegeben werden, erhöhe das Offset um 50
+            offset += 50
+
         except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 429:
-                print(f"Zu viele Anfragen, warte {wait} Sekunden...")
-                time.sleep(wait)
-                retries -= 1
-            else:
-                raise  # Andere HTTP-Fehler erneut auslösen
+            print(f"HTTPError bei {paginated_url}: {e.response.status_code}")
+            break  # Beende die Schleife bei einem HTTP-Fehler (optional)
         except requests.exceptions.RequestException as e:
-            print(f"Ein Fehler ist aufgetreten beim Abrufen der URL {baseurl}: {e}")
-            return 0
+            print(f"Fehler bei der Anfrage: {e}")
+            break  # Beende die Schleife bei einem allgemeinen Fehler (optional)
+
+    return 0  # Falls die Schleife aus irgendeinem Grund abbricht
+
 
 def fetch_posts(baseurl, user_folder):
     total_posts = fetch_post_anzahl(baseurl)
     posts = []
     offset = 0
     api_url = baseurl.replace("https://coomer.su/", "https://coomer.su/api/v1/")
-    
+    print(api_url, "angefragte apiurl")
     while offset < total_posts:
         retries = tries  # Maximale Anzahl von Wiederholungsversuchen
         while retries > 0:
             try:
                 paginated_url = f"{api_url}?o={offset}"
-                response = requests.get(paginated_url)
+                response = requests.get(paginated_url, timeout=4)  # Timeout auf 4 Sekunden gesetzt
                 response.raise_for_status()
                 page_posts = response.json()
                 posts.extend(page_posts)
                 offset += 50
                 break  # Erfolgreich, breche die innere Schleife ab
+                
             except requests.exceptions.HTTPError as e:
                 if e.response.status_code == 429:
                     print(f"Zu viele Anfragen, warte {wait} Sekunden...")
                     time.sleep(wait)
                     retries -= 1
+                elif e.response.status_code == 503:
+                    print(f"Serverfehler (503) bei {paginated_url}, warte {wait} Sekunden...")
+                    time.sleep(wait)
+                    retries -= 1
+                elif e.response.status_code == 403:
+                    print(f"Zugriff verweigert (403) bei {paginated_url}, warte {wait} Sekunden...")
+                    time.sleep(wait)
+                    retries -= 1
                 else:
                     raise
+            except requests.exceptions.ConnectTimeout:
+                print(f"Zeitüberschreitung bei der Verbindung zu {paginated_url}, versuche erneut...")
+                time.sleep(wait)
+                retries -= 1
             except requests.exceptions.RequestException as e:
                 print(f"Fehler beim Abrufen von Posts für {paginated_url}: {e}")
                 break
@@ -280,8 +336,6 @@ def cleaning():
                 clean_line = f'https://coomer.su/onlyfans/user/{clean_line}'
             outfile.write(clean_line + '\n')
 
-
-
 def save_post_urls(posts, user_folder, baseurl):
     post_urls_file = os.path.join(user_folder, "post_urls.txt")
     with open(post_urls_file, "w") as urls_file:
@@ -292,7 +346,6 @@ def save_post_urls(posts, user_folder, baseurl):
                 urls_file.write(post_url + "\n")
             else:
                 urls_file.write(post_url)  # Letzte URL ohne Zeilenumbruch
-
 
 def scraper(baseurl, name):
     if name:
@@ -324,26 +377,23 @@ def fetch_all_creator_urls(user_folder):
                         attachments.append(attachment_url)
 
         # Vorhandene URLs aus der Datei lesen
-        existing_urls = set()
-        if os.path.exists(urls_data_urls_path):
-            with open(urls_data_urls_path, 'r') as urls_file:
-                existing_urls = set(urls_file.read().splitlines())
+        existing_urls = get_urls_from_file(urls_data_urls_path)
 
-        # Neue URLs hinzufügen, nur wenn sie nicht bereits vorhanden sind
-        with open(urls_data_urls_path, 'a') as urls_file:
-            for attachment_url in attachments:
-                if attachment_url not in existing_urls:
-                    urls_file.write(attachment_url + "\n")
-                    existing_urls.add(attachment_url)
-                    print(f"Attachment URL wurde hinzugefügt: {attachment_url}")
-                else:
-                    print(f"Die Attachment URL existiert bereits: {attachment_url}")
+        # Neue URLs hinzufügen
+        new_urls = set(attachments)
+
+        # Kombiniere bestehende und neue URLs, um Duplikate zu vermeiden
+        all_urls = existing_urls.union(new_urls)
+
+        # Aktualisierte URLs in die Datei schreiben
+        save_urls_to_file(urls_data_urls_path, all_urls)
+
+        print(f"Datei {urls_data_urls_path} wurde aktualisiert.")
 
     except FileNotFoundError:
         print(f"Datei {posts_json_path} wurde nicht gefunden.")
     except json.JSONDecodeError:
         print("Fehler beim Parsen der JSON-Daten in 'posts_response.json'.")
-
 
 def fetch_fav():
     def clear_artist_urls_file():
@@ -357,7 +407,7 @@ def fetch_fav():
         url = "https://coomer.su/api/v1/account/favorites?type=artist"
         headers = {
             "accept": "application/json",
-            "Cookie": "session=..." # session key from coomer.su
+            "Cookie": key
         }
 
         response = requests.get(url, headers=headers)
@@ -379,9 +429,12 @@ def fetch_fav():
             elif artist["service"] == "onlyfans":
                 url = f"https://coomer.su/onlyfans/user/{artist['name']}"
                 save_url(url)
+            elif artist["service"] == "candfans":
+                url = f"https://coomer.su/candfans/user/{artist['name']}"
+                save_url(url)
 
     def save_url(url):
-        with open("urls.txt", "a") as file:
+        with open(urls_path, "a") as file:
             file.write(url + "\n")
 
     favorite_artists = get_favorite_artists()
@@ -390,13 +443,17 @@ def fetch_fav():
         sorted_artists = sort_favorite_artists_by_faved_seq_desc(favorite_artists)
         save_urls(sorted_artists)
 
-
-
 def main():
     if withaccornot():
         cleaning()
-        with open('urls.txt', 'r') as file:
+        with open(urls_path, 'r') as file:
             for line in file:
+                current_size = get_folder_size(base_folder)
+                if current_size >= maxgb:
+                    print(f"Current size {current_size:.2f} GB exceeds max allowed {maxgb} GB. Waiting for 12 hours...")
+                    time.sleep(timeout)
+                    continue
+
                 line = line.strip()
                 name = extract_name_from_url(line)
                 baseurl = line
@@ -406,8 +463,14 @@ def main():
                     break
     else:
         cleaning()
-        with open('urls.txt', 'r') as file:
+        with open(urls_path, 'r') as file:
             for line in file:
+                current_size = get_folder_size(base_folder)
+                if current_size >= maxgb:
+                    print(f"Current size {current_size:.2f} GB exceeds max allowed {maxgb} GB. Waiting for 12 hours...")
+                    time.sleep(timeout)
+                    continue
+
                 line = line.strip()
                 name = extract_name_from_url(line)
                 baseurl = line
